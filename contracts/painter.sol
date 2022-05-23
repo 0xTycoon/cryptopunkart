@@ -24,11 +24,12 @@ contract Painter {
     string private baseURI;
     uint256 private immutable max;                             // total supply (10,000)
     uint256 public price;
+    address constant studio = 0x0101010101010101010101010101010101010101; // paintings in progress are held by studio
     ICryptoPunks immutable public punks;
     ICigtoken immutable public cig;
     struct Painting {
-        uint256 state;
-        uint256 amountPaid;
+        State state;
+        uint256 withheld;
         uint256 updatedAt;
         uint256 punkID;
         bytes32 hash;
@@ -49,6 +50,9 @@ contract Painter {
     mapping(address => mapping(address => bool)) private approvalAll; // operator approvals
 
     event Complete(uint256 punkID);
+    event Accepted(uint256 punkID);
+    event Refund(uint256 punkID);
+    event Disputed(uint256 punkID);
     /**
      * Mint is fired when a new token is minted
      */
@@ -98,7 +102,7 @@ contract Painter {
     */
     modifier regulated(address _to) {
         require(
-            _to != DEAD_ADDRESS,
+            _to != studio,
             "cannot send to dead address"
         );
         require(
@@ -144,21 +148,24 @@ contract Painter {
         jobs[_jobIndex] = _punkID+1; // punkIDs on job index start from 1
         cig.transferFrom(msg.sender, address(this), price);
         p.state = State.Commissioned;
-        p.amountPaid = price;
+        p.withheld = price;
         p.punkID = _punkID;
         p.updatedAt = block.timestamp;
-        _transfer(address(this), curator, _punkID);
-        emit Mint(msg.sender, _punkID);
+        _transfer(address(this), studio, _punkID);
+        emit Mint(studio, _punkID);
     }
 
     /**
     * @dev artists marks the Commissioned painting completed
     */
-    function complete(uint256 _punkID, uint256 _jobIndex) external onlyCurator {
+    function complete(uint256 _punkID, uint256 _jobIndex, bytes32 _hash) external onlyCurator {
         Painting storage p = paintings[_punkID];
+        require(jobs[_jobIndex] != 0, "no job found");
+        require(jobs[_jobIndex]-1 == _punkID, "job not match punk");
         require(p.state == State.Commissioned, "painting not commissioned");
         p.state = State.Completed;
         p.updatedAt = block.timestamp;
+        p.hash = _hash;
         emit Complete(_punkID);
     }
 
@@ -167,14 +174,48 @@ contract Painter {
     */
     function accept(uint256 _punkID, uint256 _jobIndex) external  {
         require (punks.punkIndexToAddress(_punkID) == msg.sender, "must own punk");
+        require(jobs[_jobIndex] != 0, "no job found");
+        require(jobs[_jobIndex]-1 == _punkID, "job not match punk");
         Painting storage p = paintings[_punkID];
         require(p.state == State.Completed, "painting not completed");
-        p.state = State.Accepted;
-        p.updatedAt = block.timestamp;
-        cig.transfer(curator, p.amountPaid); // release funds to artist
-        _transfer(curator, msg.sender, _punkID); // transfer nft to punk holder
-        jobs[_jobIndex] = 0;
+        _accept(_punkID, _jobIndex, p, 0, address(0), msg.sender);
+    }
+
+    function _accept(
+        uint256 _punkID,
+        uint256 _jobIndex,
+        Painting storage _p,
+        uint256 ceoSplit,
+        address ceo,
+        address commissioner
+    ) internal {
+
+        _p.state = State.Accepted;
+        _p.updatedAt = block.timestamp;
+        uint256 pay = _p.withheld;
+        if (ceoSplit > 0) {
+            uint256 cut = pay / ceoSplit;
+            cig.transfer(ceo, cut);
+            pay = pay - cut;
+        }
+        cig.transfer(curator, pay);               // release funds to artist
+        _transfer(studio, commissioner, _punkID); // transfer nft to commissioner
+        jobs[_jobIndex] = 0;                      // remove the job
         emit Accepted(_punkID);
+    }
+
+    function acceptByCEO(
+        uint256 _punkID, uint256 _jobIndex
+    ) external {
+        // only CEO
+        address ceo = cig.The_CEO();
+        require(msg.sender == ceo, "must be ceo");
+        require (block.number - cig.taxBurnBlock() > 90, "90 blocks min");
+        require(jobs[_jobIndex] != 0, "no job found");
+        require(jobs[_jobIndex]-1 == _punkID, "job not match punk");
+        Painting storage p = paintings[_punkID];
+        require(p.state == State.Disputed, "painting not disputed");
+        _accept(_punkID, _jobIndex, p, 10, ceo, punks.punkIndexToAddress(_punkID)); // 10% to CEO
     }
 
     /**
@@ -182,6 +223,8 @@ contract Painter {
     */
     function dispute(uint256 _punkID, uint256 _jobIndex) external  {
         require (punks.punkIndexToAddress(_punkID) == msg.sender, "must own punk");
+        require(jobs[_jobIndex] != 0, "no job found");
+        require(jobs[_jobIndex]-1 == _punkID, "job not match punk");
         Painting storage p = paintings[_punkID];
         require(p.state == State.Completed, "painting not completed");
         p.state = State.Disputed;
@@ -189,17 +232,37 @@ contract Painter {
         emit Disputed(_punkID);
     }
 
-    function acceptByCEO() {
-        // only CEO of punks
 
-    }
 
-    function refundByCEO() {
-        // only ceo of punks
+    function refundByCEO(uint256 _punkID, uint256 _jobIndex) external {
+        address ceo = cig.The_CEO();
+        require(msg.sender == ceo, "must be ceo");
+        require (block.number - cig.taxBurnBlock() > 90, "90 blocks min");
+
+        require(jobs[_jobIndex] != 0, "no job found");
+        require(jobs[_jobIndex]-1 == _punkID, "job not match punk");
+        Painting storage p = paintings[_punkID];
+        require(p.state == State.Disputed, "painting not disputed");
+        //_p.state = State.Accepted;
+        p.updatedAt = block.timestamp;
+        uint256 pay = p.withheld;
+        uint256 cut = pay / 10;
+        cig.transfer(ceo, cut);                              // pay 10% to ceo
+        pay = pay - cut;
+        cig.transfer(punks.punkIndexToAddress(_punkID), pay);// refund to artist
+        _transfer(
+            studio,
+            address(this),
+            _punkID
+        );                                        // transfer nft to contract
+        jobs[_jobIndex] = 0;                      // remove the job
+        p.state = State.Refunded;
+        emit Refund(_punkID);
     }
 
 
     /**
+    * TODO
     * @dev burn burns a token
     */
     function burn(uint256 id) external {
@@ -783,72 +846,7 @@ interface IERC721Enumerable {
 }
 
 
-/*
- * @dev Interface of the ERC20 standard as defined in the EIP.
- */
-interface IERC20 {
-    /**
-     * @dev Returns the amount of tokens in existence.
-     */
-    function totalSupply() external view returns (uint256);
-    /**
-     * @dev Returns the amount of tokens owned by `account`.
-     */
-    function balanceOf(address account) external view returns (uint256);
-    /**
-     * @dev Moves `amount` tokens from the caller's account to `recipient`.
-     *
-     * Returns a boolean value indicating whether the operation succeeded.
-     *
-     * Emits a {Transfer} event.
-     */
-    function transfer(address recipient, uint256 amount) external returns (bool);
-    /**
-     * @dev Returns the remaining number of tokens that `spender` will be
-     * allowed to spend on behalf of `owner` through {transferFrom}. This is
-     * zero by default.
-     *
-     * This value changes when {approve} or {transferFrom} are called.
-     */
-    function allowance(address owner, address spender) external view returns (uint256);
-    /**
-     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
-     *
-     * Returns a boolean value indicating whether the operation succeeded.
-     *
-     * IMPORTANT: Beware that changing an allowance with this method brings the risk
-     * that someone may use both the old and the new allowance by unfortunate
-     * transaction ordering. One possible solution to mitigate this race
-     * condition is to first reduce the spender's allowance to 0 and set the
-     * desired value afterwards:
-     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
-     * 0xTycoon was here
-     * Emits an {Approval} event.
-     */
-    function approve(address spender, uint256 amount) external returns (bool);
-    /**
-     * @dev Moves `amount` tokens from `sender` to `recipient` using the
-     * allowance mechanism. `amount` is then deducted from the caller's
-     * allowance.
-     *
-     * Returns a boolean value indicating whether the operation succeeded.
-     *
-     * Emits a {Transfer} event.
-     */
-    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
-    /**
-     * @dev Emitted when `value` tokens are moved from one account (`from`) to
-     * another (`to`).
-     *
-     * Note that `value` may be zero.
-     */
-    event Transfer(address indexed from, address indexed to, uint256 value);
-    /**
-     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
-     * a call to {approve}. `value` is the new allowance.
-     */
-    event Approval(address indexed owner, address indexed spender, uint256 value);
-}
+
 
 /**
  * @title ERC721 token receiver interface
